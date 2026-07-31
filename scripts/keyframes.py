@@ -30,7 +30,7 @@ def shots_of(beat):
 
 def run(project_dir):
     bpath = os.path.join(project_dir, "beats.json")
-    with open(bpath) as f:
+    with open(bpath, encoding="utf-8") as f:
         doc = json.load(f)
     aspect = doc.get("aspect", "16:9")
     img_model = doc.get("image_model", IMAGE_MODEL)   # default nano-banana-2; e.g. openai/gpt-image-2/text-to-image
@@ -63,8 +63,12 @@ def run(project_dir):
                 prompt = compose_keyframe_prompt(era, scene, beat["title_cn"],
                                                  beat["title_en"], aspect)
             shot["keyframe_prompt"] = prompt
-            specs[key] = (lambda p=prompt: prov.submit_image(img_model, p,
-                                                             **image_params(img_model, aspect, img_res)))
+            specs[key] = (lambda p=prompt: prov.submit_image(
+                img_model, p,
+                image_mode=doc.get("image_mode"),
+                quality=doc.get("quality", "fast"),
+                **image_params(img_model, aspect, img_res)
+            ))
             by_key[key] = shot
 
     done = run_jobs(prov, specs, poll_s=3, stall_s=75, max_retries=2, deadline_s=300)
@@ -79,7 +83,7 @@ def run(project_dir):
         shot["keyframe_path"] = dest
         print(f"[{key}] saved {dest}")
 
-    with open(bpath, "w") as f:
+    with open(bpath, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
     print("updated", bpath)
 

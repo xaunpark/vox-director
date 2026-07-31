@@ -43,7 +43,7 @@ def shots_of(beat):
 
 
 def run(project_dir):
-    with open(os.path.join(project_dir, "beats.json")) as f:
+    with open(os.path.join(project_dir, "beats.json"), encoding="utf-8") as f:
         doc = json.load(f)
     beats = doc["beats"]
     W, H = RES.get(doc.get("aspect", "16:9"), (1920, 1080))
@@ -59,38 +59,58 @@ def run(project_dir):
     segs = []          # {clip, dur}
     beat_spans = []    # {start, dur, beat}
     t = 0.0
-    for beat in beats:
+    master_dur = float(doc.get("master_narration_dur", 0.0))
+
+    for i, beat in enumerate(beats):
         beat_start = t
         shot_list = list(shots_of(beat))
-        # ensure the beat covers its narration (extend last shot if needed)
-        durs = [float(s.get("dur", 10)) for s in shot_list]
-        need = float(beat.get("narration_dur", sum(durs))) + TAIL
-        if sum(durs) < need:
-            durs[-1] += need - sum(durs)
+
+        # Compute segment span: from this beat's audio_start to the NEXT beat's audio_start
+        # (or master_narration_dur for the last beat). This includes silence gaps between sentences.
+        has_alignment = beat.get("audio_start") is not None and beat.get("audio_end") is not None
+        if has_alignment and master_dur > 0:
+            a_start = float(beat["audio_start"])
+            if i + 1 < len(beats) and beats[i + 1].get("audio_start") is not None:
+                a_end = float(beats[i + 1]["audio_start"])
+            else:
+                a_end = master_dur
+            seg_dur = round(a_end - a_start, 2)
+            t = round(a_start + seg_dur, 2)   # keep absolute clock in sync with audio
+        else:
+            seg_dur = float(beat.get("narration_dur", 0.0)) or float(sum(float(s.get("dur", 5.0)) for s in shot_list))
+            t += seg_dur
+
+        durs = [round(seg_dur / max(1, len(shot_list)), 3)] * len(shot_list)
+
         for s, d in zip(shot_list, durs):
-            segs.append({"clip": s["clip_path"], "dur": round(d, 2)})
-            t += d
+            clip_path = s.get("clip_path") or s.get("keyframe_path")
+            if not clip_path or not os.path.exists(clip_path):
+                kf_file = os.path.join(project_dir, "keyframes", f"kf_{s.get('id', beat['id'])}.jpg")
+                if os.path.exists(kf_file):
+                    clip_path = kf_file
+                else:
+                    clip_path = s.get("keyframe_path", "")
+            segs.append({"clip": clip_path, "dur": round(d, 3)})
         beat_spans.append({"start": beat_start, "dur": round(t - beat_start, 2), "beat": beat})
-    total = round(t, 2)
+
+    total = round(master_dur if master_dur > 0 else t, 2)
 
     # ---- 1) normalise each shot to a silent segment of exactly its dur ----
     seg_files = []
     for i, s in enumerate(segs):
         out = os.path.join(tmp, f"seg_{i:02d}.mp4")
-        # If the clip is shorter than the segment (narration longer than the AI
-        # clip), slow it to fill instead of freezing the last frame.
-        cd = probe_dur(s["clip"])
-        factor = s["dur"] / cd if cd > 0 else 1.0
-        pre = f"setpts={factor:.4f}*PTS," if factor > 1.02 else ""
-        # blurred-fill background so off-aspect clips (e.g. 3:4 card in 9:16) get a
-        # nice bg instead of black bars; for matching-aspect clips the fg fills fully.
+        is_image = s["clip"].lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+        cd = probe_dur(s["clip"]) if not is_image else s["dur"]
+        factor = s["dur"] / cd if (cd > 0 and not is_image) else 1.0
+        pre = f"setpts={factor:.4f}*PTS," if abs(factor - 1.0) > 0.01 else ""
         fc = (f"[0:v]{pre}split[s0][s1];"
               f"[s0]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
               f"boxblur=26:2,eq=brightness=-0.05[bg];"
               f"[s1]scale={W}:{H}:force_original_aspect_ratio=decrease[fg];"
               f"[bg][fg]overlay=(W-w)/2:(H-h)/2,setsar=1,fps={FPS},"
               f"tpad=stop_mode=clone:stop_duration=1[v]")
-        ff(["-i", s["clip"], "-an", "-filter_complex", fc, "-map", "[v]", "-t", f"{s['dur']}",
+        input_args = ["-loop", "1", "-i", s["clip"]] if is_image else ["-i", s["clip"]]
+        ff(input_args + ["-an", "-filter_complex", fc, "-map", "[v]", "-t", f"{s['dur']}",
             "-c:v", "libx264", "-pix_fmt", "yuv420p", out])
         seg_files.append(out)
 
@@ -118,18 +138,33 @@ def run(project_dir):
             cap_pngs.append(p)
     wm_png = text_overlay.render_watermark(wm_text, os.path.join(tmp, "wm.png"), W, H)
 
-    # ---- 4) one pass: overlay captions+wm, mix per-beat narration, duck BGM ----
+    # ---- 4) one pass: overlay captions+wm, mix narration, duck BGM ----
+    master_narr = doc.get("master_narration_path")
+    if master_narr and os.path.exists(master_narr):
+        use_master = True
+    else:
+        use_master = False
+
+    bgm_p = doc.get("bgm_path") or os.path.join(project_dir, "audio", "bgm.mp3")
     nb = len(beat_spans)
     ncap = len(cap_pngs)                        # 0 when captions are off
     inputs = ["-i", body]                       # 0
     for p in cap_pngs:
         inputs += ["-i", p]                     # 1..ncap
     inputs += ["-i", wm_png]                    # ncap+1
-    narr_base = ncap + 2
-    for bs in beat_spans:
-        inputs += ["-i", bs["beat"]["narration_audio"]]   # narr inputs
-    bgm_idx = narr_base + nb
-    inputs += ["-i", doc["bgm_path"]]
+
+    if use_master:
+        narr_base = ncap + 2
+        inputs += ["-i", master_narr]           # ncap+2
+        bgm_idx = narr_base + 1
+        inputs += ["-i", bgm_p]                 # ncap+3
+    else:
+        narr_base = ncap + 2
+        for bs in beat_spans:
+            narr_path = bs["beat"].get("narration_audio") or os.path.join(project_dir, "audio", f"narr_{bs['beat']['id']}.mp3")
+            inputs += ["-i", narr_path]   # narr inputs
+        bgm_idx = narr_base + nb
+        inputs += ["-i", bgm_p]
 
     chain, prev = [], "[0:v]"
     for i, bs in enumerate(beat_spans[:ncap]):
@@ -139,16 +174,17 @@ def run(project_dir):
         prev = lbl
     chain.append(f"{prev}[{ncap+1}:v]overlay=0:0[v]")
 
-    # per-beat narration delayed to its start, then mixed
-    nlabels = []
-    for i, bs in enumerate(beat_spans):
-        ms = int(bs["start"] * 1000)
-        chain.append(f"[{narr_base+i}:a]adelay={ms}:all=1[n{i}]")
-        nlabels.append(f"[n{i}]")
-    # pad the narration mix to the FULL duration, else sidechaincompress follows the (shorter)
-    # narration length and -shortest clips the tail (e.g. a silent payoff/ending beat).
-    chain.append(f"{''.join(nlabels)}amix=inputs={nb}:normalize=0:duration=longest,volume={voice_vol},apad,atrim=0:{total}[narrmix]")
-    # a filter-output label can only be consumed once -> split narration in two
+    if use_master:
+        chain.append(f"[{narr_base}:a]volume={voice_vol},apad,atrim=0:{total}[narrmix]")
+    else:
+        # per-beat narration delayed to its start, then mixed
+        nlabels = []
+        for i, bs in enumerate(beat_spans):
+            ms = int(bs["start"] * 1000)
+            chain.append(f"[{narr_base+i}:a]adelay={ms}:all=1[n{i}]")
+            nlabels.append(f"[n{i}]")
+        chain.append(f"{''.join(nlabels)}amix=inputs={nb}:normalize=0:duration=longest,volume={voice_vol},apad,atrim=0:{total}[narrmix]")
+
     chain.append("[narrmix]asplit=2[narrA][narrB]")
     chain.append(f"[{bgm_idx}:a]atrim=0:{total},volume={music_vol},afade=t=out:st={max(total-2,0):.2f}:d=2[bgt]")
     chain.append("[bgt][narrA]sidechaincompress=threshold=0.02:ratio=12:attack=5:release=350[bgd]")

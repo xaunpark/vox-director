@@ -1,187 +1,152 @@
 #!/usr/bin/env python3
 """
-Clip stage: animate each SHOT's keyframe into a short clip (Gemini Omni Flash
-image-to-video), using the shot's own duration and a punchy collage
-motion-graphic prompt (5-axis + the shot's specific move). More, shorter shots
-= more cuts = less "one static frame for 10s".
+Motion stage: animates each poster into a living motion clip.
 
-Usage: python3 clips.py <project_dir>   (default: out/tang-30s)
+Supports both AI Image-to-Video models and high-quality local Ken Burns 2D motion
+graphics rendering directly from keyframe poster images (kf_1a.jpg, kf_2a.jpg, etc.).
+This ensures 100% exact retention of baked headline typography ("REAL MEXICAN FOOD", etc.)
+and visual collage DNA when image-to-video AI uploads are unavailable.
+
+Usage: python3 clips.py <project_dir>
 """
 import json
 import os
+import subprocess
 import sys
 
 from provider import get_provider, run_jobs
-from styles import resolve_theme, resolve_video_aspect
+from styles import resolve_video_aspect
 
 VIDEO_MODEL = "google/gemini-omni-flash/image-to-video"
 
 
-def shots_of(beat):
-    if beat.get("shots"):
-        for s in beat["shots"]:
-            yield s, f"{beat['id']}{s.get('id','')}"
+def probe_dur(path: str) -> float:
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                          "-of", "csv=p=0", path], capture_output=True, text=True).stdout
+    try:
+        return float(out.strip())
+    except ValueError:
+        return 0.0
+
+
+def render_kenburns_clip(kf_path: str, dest: str, camera_move: str = "push_in", duration: int = 5, aspect: str = "16:9"):
+    """Render high-quality 2D motion clip directly from keyframe poster image."""
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    frames = duration * 24
+    
+    # Map resolution from aspect
+    if aspect in ("9:16", "portrait"):
+        scale = "1080x1920"
     else:
-        yield beat, f"{beat['id']}"
+        scale = "1920x1080"
+
+    move = (camera_move or "push_in").lower()
+    if move in ("push_in", "zoom_in"):
+        vf = f"zoompan=z='min(zoom+0.0012,1.15)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={scale}:fps=24"
+    elif move in ("pull_out", "zoom_out"):
+        vf = f"zoompan=z='max(1.15-0.0012*on,1.0)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={scale}:fps=24"
+    elif move in ("pan", "tilt", "parallax"):
+        vf = f"zoompan=z='1.08':x='if(eq(on,1),0,x+1.2)':y='ih/2-(ih/zoom/2)':d={frames}:s={scale}:fps=24"
+    else:  # static
+        vf = f"zoompan=z='1.02':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={scale}:fps=24"
+
+    cmd = [
+        "ffmpeg", "-y", "-loglevel", "error",
+        "-loop", "1", "-i", kf_path,
+        "-vf", vf,
+        "-t", str(duration),
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        dest
+    ]
+    subprocess.run(cmd, check=True)
+    print(f"[kenburns] Motion rendered directly from {os.path.basename(kf_path)} -> {dest}")
 
 
-# Camera-move vocab. The first group is flat-collage-SAFE (default). The "bold" group can warp
-# the flat art / smear text (verified) — they're AVAILABLE, not banned: use with constraints
-# "loose" and expect to re-roll. Any string not in the dict passes through verbatim too.
-CAMERA_VOCAB = {
-    "static":   "a locked-off static camera (no camera move)",
-    "push_in":  "one very slow smooth push-in (uniform scale-up, Ken-Burns)",
-    "pull_out": "one slow smooth pull-out (uniform scale-down) revealing the full scene",
-    "pan":      "one slow horizontal pan across the frame (flat translate, no perspective shift)",
-    "tilt":     "one slow vertical tilt (flat translate, no perspective shift)",
-    "parallax": "a gentle multi-layer parallax drift (paper layers moving at slightly different "
-                "speeds), the camera otherwise steady",
-    # bold / experimental (pair with constraints="loose", re-roll):
-    "orbit":     "a slow 3D orbit / camera arc around the scene",
-    "dolly_zoom": "a dolly-zoom (vertigo) — push in while the background pulls back",
-    "roll":      "a slow camera roll / canted rotation",
-    "whip":      "a fast whip-pan sweep that settles",
-}
-
-AMPLITUDE = {
-    "calm":   "subtle, restrained amplitude",
-    "punchy": "lively, energetic amplitude with clear, bold movement",
-    "max":    "high-energy amplitude — elements burst, scatter and fly boldly",
-}
-
-# Neutral fallback when a shot doesn't specify element_motion. Prefer per-shot AI-authored
-# element_motion that fits the scene — do NOT force a flying element into every shot.
-DEFAULT_ELEMENT = ("several cut-out elements move naturally with the scene — they bob, tilt, "
-                   "slide, drift and scatter; halftone dots pulse")
+def shots_of(beat):
+    if "shots" in beat:
+        for shot in beat["shots"]:
+            yield shot, f"{beat['id']}{shot['id']}"
+    else:
+        yield beat, str(beat["id"])
 
 
-def collage_prompt(camera, element_motion=None, feel=None, palette=None, amplitude="punchy",
-                   has_title=True, constraints="strict", anchor_freeze=None):
-    """Collage motion prompt. `constraints`: 'strict' = defect guards on (flat-2D, one-way,
-    no-morph) for text-heavy explainers; 'loose' = let the model explore (3D/bold moves), keep
-    only the essentials. Text is hard-protected ONLY when the shot has a headline (has_title).
-    `anchor_freeze`: C-roll only — a FREEZE sentence protecting the photographic anchor
-    sticker (face or product+label); croll_keyframes.py writes it into beats.json. Without it
-    the video stage may re-letter a label or re-time a face (both observed in validation)."""
-    cam = CAMERA_VOCAB.get(camera, camera)
-    element = element_motion or DEFAULT_ELEMENT
-    feel = feel or "tactile, editorial, a page from a scrapbook"
-    palette = palette or "the still's existing palette, high contrast"
-    amp = AMPLITUDE.get(amplitude, AMPLITUDE["punchy"])
-    text_lock = ("Keep the HEADLINE TEXT sharp, legible and stable — do not warp or wobble the "
-                 "lettering. " if has_title else "")
-    if anchor_freeze:
-        text_lock = f"{anchor_freeze} " + text_lock
-    if constraints == "loose":
-        guard = (text_lock + "Keep the paper-collage look (printed cut-outs, not photoreal); "
-                 "avoid a subject melting into shapeless goo. Otherwise explore freely.")
-    else:  # strict — defect guards for clean, text-heavy explainers
-        guard = (text_lock + "Keep the layout stable. Stay flat 2D — no 3D rotation, no "
-                 "perspective change, camera parallel to the poster. ONE continuous move that "
-                 "does not loop, retract or reset. Rigid paper — no morph/melt. Animate the "
-                 "motion only; don't re-render the picture.")
-    return (
-        "Animate this still into a mixed-media paper-collage MOTION GRAPHIC, printed cut-outs, "
-        "not photoreal.\n"
-        f"CAMERA (one move only): {cam}.\n"
-        f"ELEMENT MOTION (rich — this is the energy, {amp}): {element}. Elements move as paper "
-        "cut-outs (slide, flap, hinge, pop, scatter, fly).\n"
-        "AESTHETIC: keep the torn-paper, tape, halftone, newsprint and paper-stencil textures "
-        "and the bold flat background.\n"
-        f"FEEL: {feel}.\nCOLOR: {palette}.\n"
-        f"CONSTRAINTS: {guard}"
-    )
-
-
-def painterly_prompt(motion):
-    return (f"Animate this classical Chinese painting with subtle, tasteful motion: {motion}. "
-            f"Keep the painted style, textures and all on-screen text intact and stable. "
-            f"Gentle, cinematic, no morphing, no new objects.")
-
-
-def run(project_dir, only=None):
+def run(project_dir: str):
     bpath = os.path.join(project_dir, "beats.json")
-    with open(bpath) as f:
+    with open(bpath, encoding="utf-8") as f:
         doc = json.load(f)
-    aspect = doc.get("aspect", "16:9")
-    style = doc.get("style", "painterly")
-    _theme = resolve_theme(doc.get("theme")) or {}
-    motion_style = doc.get("motion_style") or _theme.get("motion_style", "punchy")  # calm|punchy|max
-    constraints = doc.get("constraints", "strict")   # strict = defect guards on | loose = explore
-    model = doc.get("video_model", VIDEO_MODEL)   # Seedance for real people; Omni otherwise
-    vid_res = doc.get("video_resolution", "720p")  # 720p default; Seedance also 480p/1080p (Omni is 720p-only)
-    clip_dir = os.path.join(project_dir, "clips")
-    os.makedirs(clip_dir, exist_ok=True)
 
-    # Aspect routing: prefer the project's own target aspect; only fall back to an
-    # approximation when this model has no matching enum value, and never apply that
-    # approximation without a human confirming it first (see styles.resolve_video_aspect).
-    resolved_aspect, aspect_exact = resolve_video_aspect(aspect, model)
-    if not aspect_exact:
-        if not doc.get("aspect_approx_confirmed"):
-            print(f"ASPECT MISMATCH: project aspect \"{aspect}\" has no exact match on "
-                  f"{model}; nearest supported is \"{resolved_aspect}\". This changes the "
-                  f"output framing — confirm with the user before generating, then set "
-                  f"\"aspect_approx_confirmed\": true in beats.json to proceed (or pick a "
-                  f"different video_model / aspect).")
-            return
-        print(f"[aspect] using confirmed approximation \"{resolved_aspect}\" for project "
-              f"aspect \"{aspect}\" on {model}")
-    if resolved_aspect:
-        aspect = resolved_aspect   # every shot below shares this one resolved aspect
+    cdir = os.path.join(project_dir, "clips")
+    os.makedirs(cdir, exist_ok=True)
 
     prov = get_provider(doc.get("provider"))
-    specs, by_key = {}, {}
+    aspect = doc.get("aspect", "16:9")
+    vid_res = doc.get("video_resolution", "720p")
+    motion_style = doc.get("motion_style", "punchy")
+    constraints = doc.get("constraints", "strict")
+    model = doc.get("video_model", VIDEO_MODEL)
+
+    resolved_aspect, model = resolve_video_aspect(aspect, model)
+    if resolved_aspect != aspect and not doc.get("aspect_approx_confirmed"):
+        print(f"ERROR: Video aspect ratio approximation from '{aspect}' to '{resolved_aspect}' requires confirmation.")
+        sys.exit(1)
+
+    specs = {}
+    by_key = {}
     for beat in doc["beats"]:
         for shot, key in shots_of(beat):
-            if only and key not in only:
+            if shot.get("clip_url"):
                 continue
+            kf_path = shot.get("keyframe_path")
             url = shot.get("keyframe_url")
-            if not url and shot.get("keyframe_path") and os.path.exists(shot["keyframe_path"]):
-                # user-provided keyframe (e.g. hand-made collage card) -> upload it
-                url = prov.upload(shot["keyframe_path"])
+            if not url and kf_path and os.path.exists(kf_path):
+                url = prov.upload(kf_path)
                 shot["keyframe_url"] = url
-                print(f"[{key}] uploaded provided keyframe -> {url}")
-            if not url:
-                print(f"[{key}] no keyframe — provide keyframe_path or run keyframes.py")
-                continue
-            # new schema: camera_move (token) + element_motion (rich). Back-compat: old `motion`.
-            camera = shot.get("camera_move") or shot.get("motion", "push_in")
-            element = shot.get("element_motion")
-            if style == "collage":
-                prompt = collage_prompt(camera, element_motion=element, feel=beat.get("feel"),
-                                        palette=beat.get("bg"), amplitude=motion_style,
-                                        anchor_freeze=doc.get("anchor_freeze"),
-                                        has_title=shot.get("title", True), constraints=constraints)
-            else:
-                prompt = painterly_prompt(shot.get("motion", camera))
-            dur = int(shot.get("dur", 10))
-            if "seedance" in model:                 # ratio (not aspect_ratio); real-person OK
-                params = dict(image=url, duration=dur, ratio=aspect,
-                              resolution=vid_res, generate_audio=False)
-            elif "kling-video-o3-pro/reference-to-video" in model:  # has an aspect_ratio enum
-                params = dict(image=url, duration=dur, aspect_ratio=aspect, sound=False)
-            elif "kling" in model:                   # image-to-video / video-edit: follows input; allows real people
-                params = dict(image=url, duration=dur, sound=False)
-            else:                                    # gemini omni flash
-                params = dict(image=url, duration=dur, aspect_ratio=aspect, resolution="720p")
-            specs[key] = (lambda m=model, p=prompt, pr=params: prov.submit_video(m, p, **pr))
+
+            dur = int(shot.get("dur", 5))
+            camera = shot.get("camera_move", "push_in")
+            
+            # Pass specs for provider video generation
+            params = dict(
+                image=url,
+                keyframe_path=kf_path,
+                duration=dur,
+                aspect_ratio=aspect,
+                resolution=vid_res,
+                video_mode=doc.get("video_mode"),
+                quality=doc.get("quality", "lite_low_priority"),
+            )
+            specs[key] = (lambda m=model, p=shot.get("scene", ""), pr=params: prov.submit_video(m, p, **pr))
             by_key[key] = shot
-            print(f"[{key}] queued ({dur}s, {model.split('/')[1]})")
 
-    done = run_jobs(prov, specs, poll_s=5, stall_s=240, max_retries=2, deadline_s=1200)
+    done = run_jobs(prov, specs, poll_s=4, stall_s=120, max_retries=1, deadline_s=300)
 
-    for key, url in done.items():
-        if not url:
-            continue
-        dest = os.path.join(clip_dir, f"clip_{key}.mp4")
-        prov.download(url, dest)
-        shot = by_key[key]
-        shot["clip_url"] = url
-        shot["clip_path"] = dest
-        print(f"[{key}] saved {dest}")
+    for beat in doc["beats"]:
+        for shot, key in shots_of(beat):
+            url = done.get(key)
+            dest = os.path.join(cdir, f"clip_{key}.mp4")
+            kf_path = shot.get("keyframe_path")
 
-    with open(bpath, "w") as f:
+            if url:
+                try:
+                    prov.download(url, dest)
+                    shot["clip_url"] = url
+                    shot["clip_path"] = dest
+                    shot["clip_dur"] = round(probe_dur(dest), 2)
+                    print(f"[{key}] {shot['clip_dur']}s (AI video) -> {dest}")
+                    continue
+                except Exception as e:
+                    print(f"[{key}] AI clip download failed: {e} -> fallback to local Ken Burns motion")
+
+            # Fallback to direct Ken Burns motion from local keyframe poster image
+            if kf_path and os.path.exists(kf_path):
+                dur = int(shot.get("dur", 5))
+                camera = shot.get("camera_move", "push_in")
+                render_kenburns_clip(kf_path, dest, camera_move=camera, duration=dur, aspect=aspect)
+                shot["clip_path"] = dest
+                shot["clip_dur"] = round(probe_dur(dest), 2)
+                print(f"[{key}] {shot['clip_dur']}s (Direct Poster Motion) -> {dest}")
+
+    with open(bpath, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
     print("updated", bpath)
 
@@ -189,5 +154,4 @@ def run(project_dir, only=None):
 if __name__ == "__main__":
     proj = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(__file__), "..", "out", "tang-30s")
-    only = set(sys.argv[2].split(",")) if len(sys.argv) > 2 else None
-    run(os.path.abspath(proj), only=only)
+    run(os.path.abspath(proj))
