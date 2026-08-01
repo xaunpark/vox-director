@@ -70,7 +70,7 @@ def shots_of(beat):
         yield beat, str(beat["id"])
 
 
-def run(project_dir: str):
+def run(project_dir: str, target_shots: list = None):
     bpath = os.path.join(project_dir, "beats.json")
     with open(bpath, encoding="utf-8") as f:
         doc = json.load(f)
@@ -94,6 +94,8 @@ def run(project_dir: str):
     by_key = {}
     for beat in doc["beats"]:
         for shot, key in shots_of(beat):
+            if target_shots and key not in target_shots:
+                continue
             if shot.get("clip_url"):
                 continue
             kf_path = shot.get("keyframe_path")
@@ -115,16 +117,22 @@ def run(project_dir: str):
                 video_mode=doc.get("video_mode"),
                 quality=doc.get("quality", "lite_low_priority"),
             )
-            specs[key] = (lambda m=model, p=shot.get("scene", ""), pr=params: prov.submit_video(m, p, **pr))
+            def make_submitter(m=model, p=shot.get("scene", ""), pr=params, s_ref=shot):
+                jid = prov.submit_video(m, p, **pr)
+                s_ref["job_id"] = jid
+                return jid
+
+            specs[key] = make_submitter
             by_key[key] = shot
 
-    done = run_jobs(prov, specs, poll_s=4, stall_s=120, max_retries=1, deadline_s=300)
+    done = run_jobs(prov, specs, poll_s=4, stall_s=60, max_retries=2, deadline_s=900, max_concurrency=4, submit_delay_s=2.5)
 
     for beat in doc["beats"]:
         for shot, key in shots_of(beat):
+            if target_shots and key not in target_shots:
+                continue
             url = done.get(key)
             dest = os.path.join(cdir, f"clip_{key}.mp4")
-            kf_path = shot.get("keyframe_path")
 
             if url:
                 try:
@@ -132,19 +140,12 @@ def run(project_dir: str):
                     shot["clip_url"] = url
                     shot["clip_path"] = dest
                     shot["clip_dur"] = round(probe_dur(dest), 2)
-                    print(f"[{key}] {shot['clip_dur']}s (AI video) -> {dest}")
-                    continue
+                    print(f"[{key}] {shot['clip_dur']}s (AI video, job_id={shot.get('job_id')}) -> {dest}")
                 except Exception as e:
-                    print(f"[{key}] AI clip download failed: {e} -> fallback to local Ken Burns motion")
-
-            # Fallback to direct Ken Burns motion from local keyframe poster image
-            if kf_path and os.path.exists(kf_path):
-                dur = int(shot.get("dur", 5))
-                camera = shot.get("camera_move", "push_in")
-                render_kenburns_clip(kf_path, dest, camera_move=camera, duration=dur, aspect=aspect)
-                shot["clip_path"] = dest
-                shot["clip_dur"] = round(probe_dur(dest), 2)
-                print(f"[{key}] {shot['clip_dur']}s (Direct Poster Motion) -> {dest}")
+                    print(f"[{key}] AI clip download failed: {e}")
+            else:
+                # User requested NO Ken Burns fallback; leave clip incomplete so it can be retried
+                print(f"[{key}] WARNING: AI video generation did not yield a clip.")
 
     with open(bpath, "w", encoding="utf-8") as f:
         json.dump(doc, f, ensure_ascii=False, indent=2)
@@ -154,4 +155,9 @@ def run(project_dir: str):
 if __name__ == "__main__":
     proj = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
         os.path.dirname(__file__), "..", "out", "tang-30s")
-    run(os.path.abspath(proj))
+    shots_filter = None
+    if "--shots" in sys.argv:
+        idx = sys.argv.index("--shots")
+        if idx + 1 < len(sys.argv):
+            shots_filter = sys.argv[idx + 1].split(",")
+    run(os.path.abspath(proj), target_shots=shots_filter)

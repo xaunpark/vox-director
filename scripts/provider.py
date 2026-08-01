@@ -287,37 +287,63 @@ def get_provider(name=None):
     return _REGISTRY[name]()
 
 
-def run_jobs(prov, specs, *, poll_s=3, stall_s=90, max_retries=2, deadline_s=900):
-    """Submit + poll a batch of jobs, resubmitting any that FAIL or STALL."""
-    st = {}
-    for key, submit in specs.items():
-        st[key] = {"pid": submit(), "t": time.time(), "tries": 0}
-        print(f"[{key}] submitted {st[key]['pid']}")
-
+def run_jobs(prov, specs, *, poll_s=3, stall_s=60, max_retries=1, deadline_s=900, max_concurrency=4, submit_delay_s=2.5):
+    """Submit + poll a batch of jobs with strict concurrency limiting (default max 4 parallel tasks)
+    and smooth request spacing (submit_delay_s) to prevent API spamming/rate limits."""
+    pending = {}  # key -> {"pid": ..., "t": ..., "tries": ...}
     done = {}
+    queue = list(specs.keys())
+
+    def start_next_jobs():
+        while queue and len(pending) < max_concurrency:
+            key = queue.pop(0)
+            try:
+                pid = specs[key]()
+                pending[key] = {"pid": pid, "t": time.time(), "tries": 0}
+                print(f"[{key}] submitted {pid} (active: {len(pending)}/{max_concurrency})")
+                if queue and len(pending) < max_concurrency:
+                    time.sleep(submit_delay_s)
+            except Exception as e:
+                done[key] = None
+                print(f"[{key}] submit error: {e}")
+
+    start_next_jobs()
     deadline = time.time() + deadline_s
     while len(done) < len(specs) and time.time() < deadline:
         time.sleep(poll_s)
         now = time.time()
-        for key, submit in specs.items():
-            if key in done:
-                continue
-            s = st[key]
+        active_keys = list(pending.keys())
+        for key in active_keys:
+            s = pending[key]
             r = prov.get_status(s["pid"])
             status = r["status"]
+            is_stalled = (status == "pending" and now - s["t"] > stall_s)
             if status == "completed":
                 done[key] = r["output"]
+                del pending[key]
                 print(f"[{key}] done")
-            elif status == "failed" or (status == "pending" and now - s["t"] > stall_s):
+                start_next_jobs()
+            elif status == "failed" or is_stalled:
+                why = "failed" if status == "failed" else f"stalled>{int(stall_s)}s"
                 if s["tries"] < max_retries:
                     s["tries"] += 1
-                    s["pid"] = submit()
-                    s["t"] = time.time()
-                    why = "failed" if status == "failed" else f"stalled>{int(stall_s)}s"
-                    print(f"[{key}] {why} -> resubmit #{s['tries']} ({s['pid']})")
-                elif status == "failed":
+                    try:
+                        time.sleep(submit_delay_s)
+                        s["pid"] = specs[key]()
+                        s["t"] = time.time()
+                        print(f"[{key}] {why} -> resubmit #{s['tries']} ({s['pid']})")
+                    except Exception as e:
+                        done[key] = None
+                        del pending[key]
+                        print(f"[{key}] resubmit error: {e}")
+                        start_next_jobs()
+                else:
                     done[key] = None
-                    print(f"[{key}] FAILED: {(r.get('error') or '')[:120]}")
+                    del pending[key]
+                    err_msg = r.get("error") or why
+                    print(f"[{key}] {why} -> max retries reached, skipping: {str(err_msg)[:120]}")
+                    start_next_jobs()
+
     for key in specs:
         done.setdefault(key, None)
     return done

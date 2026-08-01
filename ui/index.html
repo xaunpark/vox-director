@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Vox Studio — Real-Time Live Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+  <div id="app">
+    <!-- Header Navbar -->
+    <header class="studio-header">
+      <div class="brand">
+        <div class="logo-badge">VOX</div>
+        <div class="brand-text">
+          <h1>Vox Studio Dashboard</h1>
+          <span class="subtitle">Real-Time AI Agent Video Engine Monitor</span>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <div class="control-group">
+          <label for="project-select">Active Project:</label>
+          <select id="project-select" class="studio-select">
+            <option value="">Loading projects...</option>
+          </select>
+        </div>
+        <div id="live-indicator" class="live-indicator pulse">
+          <span class="dot"></span> LIVE SSE
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Container -->
+    <main class="dashboard-body">
+      <!-- Top Overview Bar -->
+      <section class="overview-bar card">
+        <div class="project-info">
+          <h2 id="project-title">No Active Project Selected</h2>
+          <div class="meta-badges">
+            <span id="badge-aspect" class="badge">16:9</span>
+            <span id="badge-style" class="badge">70s-groovy</span>
+            <span id="badge-voice" class="badge">Gemini TTS (Charon)</span>
+            <span id="badge-beats" class="badge">0 Shots</span>
+          </div>
+        </div>
+
+        <!-- Pipeline Progress Steps -->
+        <div class="pipeline-progress">
+          <div class="stage-step" id="step-script">
+            <div class="step-icon">📜</div>
+            <div class="step-label">Script & Beats</div>
+            <div class="step-status">Ready</div>
+          </div>
+          <div class="stage-line"></div>
+          <div class="stage-step" id="step-keyframes">
+            <div class="step-icon">🖼️</div>
+            <div class="step-label">Keyframes</div>
+            <div class="step-status">0/0</div>
+          </div>
+          <div class="stage-line"></div>
+          <div class="stage-step" id="step-clips">
+            <div class="step-icon">🎬</div>
+            <div class="step-label">Video AI (VEO)</div>
+            <div class="step-status">0/0</div>
+          </div>
+          <div class="stage-line"></div>
+          <div class="stage-step" id="step-audio">
+            <div class="step-icon">🎙️</div>
+            <div class="step-label">Audio & Align</div>
+            <div class="step-status">Pending</div>
+          </div>
+          <div class="stage-line"></div>
+          <div class="stage-step" id="step-final">
+            <div class="step-icon">🏆</div>
+            <div class="step-label">Final Render</div>
+            <div class="step-status">Pending</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Layout Grid: Left Script Inspector | Right Live Media Grid -->
+      <div class="workspace-grid">
+        <!-- Left Panel: Script & Shot Inspector -->
+        <section class="panel script-panel card">
+          <div class="panel-header">
+            <h3><span class="icon">📝</span> Script & Shot Inspector</h3>
+            <span id="shot-count-tag" class="tag">0 Shots</span>
+          </div>
+          <div id="script-inspector" class="panel-content scrollable">
+            <div class="empty-state">Select a project to inspect script breakdown...</div>
+          </div>
+        </section>
+
+        <!-- Right Panel: Live Media Grid -->
+        <section class="panel media-panel card">
+          <div class="panel-header">
+            <h3><span class="icon">🖼️</span> Live Media Gallery (Real-Time Cards)</h3>
+            <div class="panel-actions">
+              <span id="gallery-status" class="tag tag-active">Live Updating</span>
+            </div>
+          </div>
+          <div id="media-grid" class="media-cards-grid scrollable">
+            <div class="empty-state">Waiting for keyframe and video AI generation...</div>
+          </div>
+        </section>
+      </div>
+
+      <!-- Bottom Panel: Final Video Showcase -->
+      <section id="final-video-section" class="final-panel card hidden">
+        <div class="panel-header">
+          <h3><span class="icon">🎬</span> Final Rendered Output (Master MP4)</h3>
+          <span id="final-size-tag" class="tag tag-success">Completed</span>
+        </div>
+        <div class="final-video-container">
+          <video id="final-video-player" controls preload="auto">
+            Your browser does not support HTML5 video.
+          </video>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

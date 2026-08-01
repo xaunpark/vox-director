@@ -31,18 +31,26 @@ def _headers(json_body: bool = True) -> dict:
     return h
 
 
-def _post(path: str, payload: dict, base: str = BASE_URL, timeout: int = 60) -> dict:
+def _post(path: str, payload: dict, base: str = BASE_URL, timeout: int = 60, max_retries: int = 4) -> dict:
     url = base + path
     data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=_headers(), method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.load(r)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        raise FlowToolError(f"POST {path} -> {e.code}: {body[:400]}") from e
-    except Exception as e:
-        raise FlowToolError(f"POST {path} failed: {e}") from e
+    for attempt in range(1, max_retries + 1):
+        req = urllib.request.Request(url, data=data, headers=_headers(), method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.load(r)
+        except urllib.error.HTTPError as e:
+            body = e.read().decode(errors="replace")
+            if e.code == 429 and attempt < max_retries:
+                print(f"[flow_tool] HTTP 429 Rate Limit (attempt {attempt}/{max_retries}). Waiting 15s...")
+                time.sleep(15.0)
+                continue
+            raise FlowToolError(f"POST {path} -> {e.code}: {body[:400]}") from e
+        except Exception as e:
+            if attempt < max_retries:
+                time.sleep(4.0)
+                continue
+            raise FlowToolError(f"POST {path} failed: {e}") from e
 
 
 def _get(path: str, base: str = BASE_URL, timeout: int = 60, retries: int = 3) -> dict:
